@@ -199,7 +199,7 @@ renderTrace' lookupEvent lookupDescs (columns, events) = unlines renderedLines
       | Event {change = Observe name} <- event $ lookupEvent p =
         "-- request value of " ++ unpack name
     explain uid Event {eventParent = Parent p i, change = Enter}
-      | Event {change = Cons ar name} <- event $ lookupEvent p =
+      | Event {change = Cons cid ar name} <- event $ lookupEvent p =
         "-- request value of arg " ++ show i ++ " of constructor " ++ unpack name
     -- Arguments of functions
     explain uid me@Event {eventParent = Parent p 0, change = it@FunOrCons}
@@ -217,8 +217,8 @@ renderTrace' lookupEvent lookupDescs (columns, events) = unlines renderedLines
       , arg <- findArg p =
         "-- " ++ unpack name ++ "/" ++ show (dist+1) ++ " " ++ arg ++" = " ++ findValue lookupDescs (EventWithId uid me)
     -- Descendants of Cons events
-    explain uid Event {eventParent = Parent p i, change = Cons _ name}
-      | Event {change = Cons ar name'} <- event $ lookupEvent p =
+    explain uid Event {eventParent = Parent p i, change = Cons _ _ name}
+      | Event {change = Cons cid ar name'} <- event $ lookupEvent p =
         "-- arg " ++ show i ++ " of constructor " ++ unpack name' ++ " is " ++ unpack name
     -- Descendants of root events
     explain uid Event {eventParent = Parent p i, change = Fun}
@@ -236,7 +236,7 @@ renderTrace' lookupEvent lookupDescs (columns, events) = unlines renderedLines
     variableNames = map (:[]) ['a'..'z']
 
     showChange Fun = "a function"
-    showChange (Cons ar name) = "constructor " ++ unpack name
+    showChange (Cons cid ar name) = "constructor " ++ unpack name
 
     findArg eventUID =
       case [ e | e@(event -> Event{eventParent = Parent p 0, change = Cons{}}) <- lookupDescs eventUID] of
@@ -247,8 +247,8 @@ findValue :: (UID -> [EventWithId]) -> EventWithId -> String
 findValue lookupDescs = go
   where
     go :: EventWithId -> String
-    go EventWithId {eventUID = me, event = Event {change = ConsChar c}} = show c
-    go EventWithId {eventUID = me, event = Event {change = Cons ar name}}
+    go EventWithId {eventUID = me, event = Event {change = ConsChar cid c}} = show c
+    go EventWithId {eventUID = me, event = Event {change = Cons cid ar name}}
       | ar == 0 = unpack name
       | isAlpha (T.head name) =
         unpack name ++
@@ -299,7 +299,7 @@ buildExplanation lookupEvent lookupDescs = go . event where
   go Event{eventParent = Parent p pos, change = Fun}
     | Request rd <- go (event $ lookupEvent p)
     = Return rd ReturnFun
-  go Event{eventParent = Parent p pos, change = Cons ar name}
+  go Event{eventParent = Parent p pos, change = Cons cid ar name}
     | Request rd <- go (event $ lookupEvent p)
     , value <- findValue lookupDescs (lookupEvent p)
     = Return rd (ReturnCons name ar value)

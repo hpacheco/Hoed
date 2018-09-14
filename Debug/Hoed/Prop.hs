@@ -589,7 +589,7 @@ generateExpr unevalGen _ _ _ Nothing    = unevalGen
 generateExpr unevalGen trc getEvent frt (Just e) = 
   -- (propVarReturn $ "{- generateExpr " ++ show e ++ "-}") `pvCat` 
   case change (event e) of
-  (Cons _ (T.unpack -> s)) -> let s' = if isAlpha (head s) then s else "(" ++ s ++ ")"
+  (Cons cid _ (T.unpack -> s)) -> let s' = if isAlpha (head s) then s else "(" ++ s ++ ")"
                 in liftPV (++) ( foldl (liftPV $ \acc c -> acc ++ " " ++ c)
                                  (propVarReturn ("(" ++ s')) cs
                                ) 

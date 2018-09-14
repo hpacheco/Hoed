@@ -81,6 +81,7 @@ module Debug.Hoed.Observe
   , initUniq
   , startEventStream
   , endEventStream
+  , Sharings(..)
   , ourCatchAllIO
   , peepUniq
   ) -} where
@@ -100,11 +101,15 @@ import Control.Concurrent.MVar
 import Control.Monad
 import Data.Array as Array
 import Data.HashMap.Strict (HashMap)
-import qualified Data.HashMap.Strict as H
+import qualified Data.HashMap.Strict as HMap
+import Data.IntMap (IntMap(..))
+import qualified Data.IntMap as IMap
 import Data.IORef
 import Data.List (sortOn)
 import Data.Maybe
 import Data.Monoid ((<>))
+import Data.HashMap.Strict (HashMap(..))
+import qualified Data.HashMap.Strict as HashMap
 import Data.Proxy
 import Data.Rope.Mutable (Rope, new', write, reset)
 import Data.Strict.Tuple (Pair(..))
@@ -122,6 +127,8 @@ import GHC.Generics
 
 import Data.IORef
 import System.IO.Unsafe
+import System.Mem.StableName
+import Unsafe.Coerce
 
 \end{code}
 
@@ -156,13 +163,62 @@ data Event = Event { eventParent :: {-# UNPACK #-} !Parent
 
 data EventWithId = EventWithId {eventUID :: !UID, event :: !Event}
 
+type Sharing = (Maybe UID)
+
 data Change
-        = Observe          !Text
-        | Cons     !Word8  !Text
-        | ConsChar         !Char
+        = Observe                 !Text
+        | Cons     Sharing !Word8 !Text
+        | ConsChar Sharing        !Char
         | Enter
         | Fun
-        deriving (Eq, Show,Generic)
+        deriving (Eq,Show,Generic)
+
+-- | State to keep track of observable sharing
+type Sharings = HashMap DynStableName [UID] -- mapping from sharings to their node occurences
+
+--getSharings :: IO Sharings
+--getSharings = do
+--    as <- readMVar aliases
+--    return $ IMap.fromList $ map (\(k,v) -> (getConsId k,getConsId v)) $ HashMap.toList as
+--
+--logAliases :: IO ()
+--logAliases = do
+--    as <- readMVar aliases
+--    putStrLn "=== Aliases ==="
+--    forM_ (HashMap.toList as) $ \(from,to) -> putStrLn $ show (getConsId from) ++ " -> " ++ show (getConsId to)
+
+{-# NOINLINE sharings #-}
+sharings :: MVar Sharings
+sharings = unsafePerformIO $ newMVar $ HMap.empty
+    
+addAlias :: DynStableName -> DynStableName -> IO ()
+addAlias from to
+    | eqStableName from to = return ()
+    | otherwise = do
+        modifyMVar_ sharings $ \as -> return $ HMap.insertWith (++) from (concat $ maybeToList $ HMap.lookup to as) as
+
+-- register the alias of a new node
+addAliasNode :: DynStableName -> UID -> IO ()
+addAliasNode sn node = do
+    modifyMVar_ sharings $ return . HMap.insertWith (++) sn [node]
+
+-- to allow observable sharing
+type DynStableName = StableName ()
+
+mkDynStableName :: a -> IO DynStableName
+mkDynStableName x | x `seq` True = do
+    sx <- makeStableName x
+    return $ whnf (unsafeCoerce sx)
+
+getSharing :: DynStableName -> IO Sharing
+getSharing sn = do
+    as <- readMVar sharings
+    let nodes = concat $ maybeToList $ HMap.lookup sn as
+    if length nodes > 1
+        then return $ Just (last nodes)
+        else return Nothing
+        
+whnf x = x `seq` x
 
 type ParentPosition = Word8
 
@@ -192,7 +248,7 @@ type Trace = Vector Event
 endEventStream :: IO Trace
 endEventStream = do
   (stringsCount :!: stringsHashTable) <- takeMVar strings
-  let unsortedStrings = H.toList stringsHashTable
+  let unsortedStrings = HMap.toList stringsHashTable
   putMVar strings (0 :!: mempty)
   let stringsTable = V.unsafeAccum (\_ -> id) (V.replicate stringsCount (error "uninitialized")) [(i,s) | (s,i) <- unsortedStrings]
   writeIORef stringsLookupTable stringsTable
@@ -205,15 +261,15 @@ sendEvent nodeId !parent !change = do
 lookupOrAddString :: Text -> IO Int
 lookupOrAddString s = do
   (stringsCount :!: stringsTable) <- readMVar strings
-  case H.lookup s stringsTable of
+  case HMap.lookup s stringsTable of
     Just x  -> return x
     Nothing -> do
       (stringsCount :!: stringsTable) <- takeMVar strings
       let (count',table', res) =
-            case H.lookup s stringsTable of
+            case HMap.lookup s stringsTable of
               Just x -> (stringsCount, stringsTable, x)
               Nothing ->
-                (stringsCount+1, H.insert s stringsCount stringsTable, stringsCount)
+                (stringsCount+1, HMap.insert s stringsCount stringsTable, stringsCount)
       putMVar strings (count' :!: table')
       return res
 
@@ -237,20 +293,25 @@ stringsLookupTable = unsafePerformIO $ newIORef  mempty
 
 lookupString id = unsafePerformIO $ (V.! id) <$> readIORef  stringsLookupTable
 
+derivingUnbox "Sharing"
+    [t| Sharing -> Int |]
+    [| maybe (-1) id |]
+    [| \n -> if (n<0) then Nothing else Just n |]
+
 derivingUnbox "Change"
-    [t| Change -> (Word8, Word8, Int) |]
+    [t| Change -> (Word8, Sharing, Word8, Int) |]
     [| \case
-            Observe  s -> (0,0,unsafePerformIO(lookupOrAddString s))
-            Cons c   s -> (1,c,unsafePerformIO(lookupOrAddString s))
-            ConsChar c -> (2,0,fromEnum c)
-            Enter      -> (3,0,0)
-            Fun        -> (4,0,0)
+            Observe  s -> (0,Nothing,0,unsafePerformIO(lookupOrAddString s))
+            Cons cid c   s -> (1,cid,c,unsafePerformIO(lookupOrAddString s))
+            ConsChar cid c -> (2,cid,0,fromEnum c)
+            Enter      -> (3,Nothing,0,0)
+            Fun        -> (4,Nothing,0,0)
      |]
-    [| \case (0,_,s) -> Observe (lookupString s)
-             (1,c,s) -> Cons c  (lookupString s)
-             (2,_,c) -> ConsChar (toEnum c)
-             (3,_,_) -> Enter
-             (4,_,_) -> Fun
+    [| \case (0,_,_,s) -> Observe (lookupString s)
+             (1,cid,c,s) -> Cons cid c  (lookupString s)
+             (2,cid,_,c) -> ConsChar cid (toEnum c)
+             (3,_,_,_) -> Enter
+             (4,_,_,_) -> Fun
      |]
 
 derivingUnbox "Parent"
@@ -314,16 +375,16 @@ The generic implementation of the observer function.
 class Observable a where
         observer  :: a -> Parent -> a
         default observer :: (Generic a, GObservable (Rep a)) => a -> Parent -> a
-        observer x c = to (gdmobserver (from x) c)
+        observer x c = to (gdmobserver x (from x) c)
 
         constrain :: a -> a -> a
         default constrain :: (Generic a, GConstrain (Rep a)) => a -> a -> a
         constrain x c = to (gconstrain (from x) (from c))
 
 class GObservable f where
-        gdmobserver :: f a -> Parent -> f a
-        gdmObserveArgs :: f a -> ObserverM (f a)
-        gdmShallowShow :: f a -> Text
+        gdmobserver :: b -> f a -> Parent -> f a
+        gdmObserveArgs :: b -> f a -> ObserverM (f a)
+        gdmShallowShow :: b -> f a -> Text
 
 constrainBase :: (Show a, Eq a) => a -> a -> a
 constrainBase x c | x == c = x
@@ -359,51 +420,51 @@ Observing the children of Data types of kind *.
 -- Meta: data types
 -- FieldLimit requires undecidable instances
 instance (FieldLimit ('S ('S ('S ('S ('S ('S 'Z)))))) a, GObservable a) => GObservable (M1 D d a) where
- gdmobserver m@(M1 x) cxt = M1 (gdmobserver x cxt)
+ gdmobserver v m@(M1 x) cxt = M1 (gdmobserver v x cxt)
  gdmObserveArgs = gthunk
  gdmShallowShow = error "gdmShallowShow not defined on the <<data meta type>>"
 
 -- Meta: Selectors
 instance (GObservable a, Selector s) => GObservable (M1 S s a) where
- gdmobserver (M1 x) cxt = M1 (gdmobserver x cxt)
+ gdmobserver v (M1 x) cxt = M1 (gdmobserver v x cxt)
  gdmObserveArgs = gthunk
  gdmShallowShow = error "gdmShallowShow not defined on the <<selector meta type>>"
 
 -- Meta: Constructors
 instance (GObservable a, Constructor c) => GObservable (M1 C c a) where
- gdmobserver m1 = send (gdmShallowShow m1) (gdmObserveArgs m1)
- gdmObserveArgs (M1 x) = do {x' <- gdmObserveArgs x; return (M1 x')}
- gdmShallowShow = pack . conName
+ gdmobserver v m1 = send v (gdmShallowShow v m1) (gdmObserveArgs v m1)
+ gdmObserveArgs v (M1 x) = do {x' <- gdmObserveArgs v x; return (M1 x')}
+ gdmShallowShow v = pack . conName
 
 -- Unit: used for constructors without arguments
 instance GObservable U1 where
- gdmobserver x _ = x
- gdmObserveArgs = return
- gdmShallowShow = error "gdmShallowShow not defined on <<the unit type>>"
+ gdmobserver v x _ = x
+ gdmObserveArgs v = return
+ gdmShallowShow v = error "gdmShallowShow not defined on <<the unit type>>"
 
 -- Sums: encode choice between constructors
 instance (GObservable a, GObservable b) => GObservable (a :+: b) where
- gdmobserver (L1 x) = send (gdmShallowShow x) (gdmObserveArgs $ L1 x)
- gdmobserver (R1 x) = send (gdmShallowShow x) (gdmObserveArgs $ R1 x)
- gdmShallowShow (L1 x) = gdmShallowShow x
- gdmShallowShow (R1 x) = gdmShallowShow x
- gdmObserveArgs (L1 x) = do {x' <- gdmObserveArgs x; return (L1 x')}
- gdmObserveArgs (R1 x) = do {x' <- gdmObserveArgs x; return (R1 x')}
+ gdmobserver v (L1 x) = send v (gdmShallowShow v x) (gdmObserveArgs v $ L1 x)
+ gdmobserver v (R1 x) = send v (gdmShallowShow v x) (gdmObserveArgs v $ R1 x)
+ gdmShallowShow v (L1 x) = gdmShallowShow v x
+ gdmShallowShow v (R1 x) = gdmShallowShow v x
+ gdmObserveArgs v (L1 x) = do {x' <- gdmObserveArgs v x; return (L1 x')}
+ gdmObserveArgs v (R1 x) = do {x' <- gdmObserveArgs v x; return (R1 x')}
 
 -- Products: encode multiple arguments to constructors
 instance (GObservable a, GObservable b) => GObservable (a :*: b) where
- gdmobserver (a :*: b) cxt = (gdmobserver a cxt) :*: (gdmobserver b cxt)
- gdmObserveArgs (a :*: b) = do 
-   a'  <- gdmObserveArgs a
-   b'  <- gdmObserveArgs b
+ gdmobserver v (a :*: b) cxt = (gdmobserver v a cxt) :*: (gdmobserver v b cxt)
+ gdmObserveArgs v (a :*: b) = do 
+   a'  <- gdmObserveArgs v a
+   b'  <- gdmObserveArgs v b
    return (a' :*: b')
- gdmShallowShow = error "gdmShallowShow not defined on <<the product type>>"
+ gdmShallowShow v = error "gdmShallowShow not defined on <<the product type>>"
 
 -- Constants: additional parameters and recursion of kind *
 instance (Observable a) => GObservable (K1 i a) where
- gdmobserver (K1 x) cxt = K1 $ observer x cxt
+ gdmobserver v (K1 x) cxt = K1 $ observer x cxt
  gdmObserveArgs = gthunk
- gdmShallowShow = error "gdmShallowShow not defined on <<the constant type>>"
+ gdmShallowShow v = error "gdmShallowShow not defined on <<the constant type>>"
 
 \end{code}
 
@@ -448,10 +509,13 @@ instance Observable Float   where observer  = observeBase
 instance Observable Double  where observer  = observeBase
                                   constrain = constrainBase
 instance Observable Char    where
-  observer lit cxt = seq lit $ unsafeWithUniq $ \node -> do
-    sendEvent node cxt (ConsChar lit)
-    return lit
-  constrain = constrainBase
+    observer lit cxt = seq lit $ unsafeWithUniq $ \node -> do
+        slit <- mkDynStableName lit
+        addAliasNode slit node
+        cid <- getSharing slit
+        sendEvent node cxt (ConsChar cid lit)
+        return lit
+    constrain = constrainBase
 instance Observable ()      where observer  = observeOpaque "()"
                                   constrain = constrainBase
 
@@ -461,47 +525,47 @@ instance Observable ()      where observer  = observeOpaque "()"
 -- we evalute to WHNF, and not further.
 
 observeBase :: (Show a) => a -> Parent -> a
-observeBase lit cxt = seq lit $ send (pack $ show lit) (return lit) cxt
+observeBase lit cxt = seq lit $ send lit (pack $ show lit) (return lit) cxt
 
 observeOpaque :: Text -> a -> Parent -> a
-observeOpaque str val cxt = seq val $ send str (return val) cxt
+observeOpaque str val cxt = seq val $ send val str (return val) cxt
 \end{code}
 
 The Constructors.
 
 \begin{code}
 instance (Observable a,Observable b) => Observable (a,b) where
-  observer (a,b) = send "," (return (,) << a << b)
+  observer v@(a,b) = send v "," (return (,) << a << b)
 
 instance (Observable a,Observable b,Observable c) => Observable (a,b,c) where
-  observer (a,b,c) = send "," (return (,,) << a << b << c)
+  observer v@(a,b,c) = send v "," (return (,,) << a << b << c)
 
 instance (Observable a,Observable b,Observable c,Observable d) 
           => Observable (a,b,c,d) where
-  observer (a,b,c,d) = send "," (return (,,,) << a << b << c << d)
+  observer v@(a,b,c,d) = send v "," (return (,,,) << a << b << c << d)
 
 instance (Observable a,Observable b,Observable c,Observable d,Observable e) 
          => Observable (a,b,c,d,e) where
-  observer (a,b,c,d,e) = send "," (return (,,,,) << a << b << c << d << e)
+  observer v@(a,b,c,d,e) = send v "," (return (,,,,) << a << b << c << d << e)
 
 instance (Observable a) => Observable [a] where
-  observer (a:as) = send ":"  (return (:) << a << as)
-  observer []     = send "[]" (return [])
+  observer v@(a:as) = send v ":"  (return (:) << a << as)
+  observer v@[]     = send v "[]" (return v)
 
 instance (Observable a) => Observable (Maybe a) where
-  observer (Just a) = send "Just"    (return Just << a)
-  observer Nothing  = send "Nothing" (return Nothing)
+  observer v@(Just a) = send v "Just"    (return Just << a)
+  observer v@Nothing  = send v "Nothing" (return v)
 
 instance (Observable a,Observable b) => Observable (Either a b) where
-  observer (Left a)  = send "Left"  (return Left  << a)
-  observer (Prelude.Right a) = send "Right" (return Prelude.Right << a)
+  observer v@(Left a)  = send v "Left"  (return Left  << a)
+  observer v@(Prelude.Right a) = send v "Right" (return Prelude.Right << a)
 \end{code}
 
 Arrays.
 
 \begin{code}
 instance (Ix a,Observable a,Observable b) => Observable (Array.Array a b) where
-  observer arr = send "array" (return Array.array << Array.bounds arr 
+  observer arr = send arr "array" (return Array.array << Array.bounds arr 
                                                   << Array.assocs arr
                               )
   constrain = undefined
@@ -513,7 +577,7 @@ IO monad.
 instance (Observable a) => Observable (IO a) where
   observer fn cxt = 
         do res <- fn
-           send "<IO>" (return return << res) cxt
+           send fn "<IO>" (return return << res) cxt
   constrain = undefined
 \end{code}
 
@@ -523,7 +587,7 @@ The Exception *datatype* (not exceptions themselves!).
 
 \begin{code}
 instance Observable SomeException where
-  observer e = send ("<Exception> " <> pack(show e)) (return e)
+  observer e = send e ("<Exception> " <> pack(show e)) (return e)
   constrain = undefined
 
 -- instance Observable ErrorCall where
@@ -551,6 +615,7 @@ instance Observable Dynamic where
 
 The Observer monad, a simple state monad, 
 for placing numbers on sub-observations.
+hpacheco: Added a state of @StableName@ aliases to preserve observable sharing, i.e., @Observable@ instances remove all sharing but we remember the value relationships.
 
 \begin{code}
 newtype ObserverM a = ObserverM { runMO :: Int -> Word8 -> (a,Word8) }
@@ -579,14 +644,14 @@ thunk f a = ObserverM $ \ parent port ->
                                 }) 
                 , port+1 )
 
-gthunk :: (GObservable f) => f a -> ObserverM (f a)
-gthunk a = ObserverM $ \ parent port ->
-                ( gdmobserver_ a (Parent
+gthunk :: (GObservable f) => b -> f a -> ObserverM (f a)
+gthunk b a = ObserverM $ \ parent port ->
+                ( gdmobserver_ b a (Parent
                                 { parentUID = parent
                                 , parentPosition   = port
                                 }) 
                 , port+1 )
-
+    
 (<<) :: (Observable a) => ObserverM (a -> b) -> a -> ObserverM b
 -- fn << a = do { fn' <- fn ; a' <- thunk a ; return (fn' a') }
 fn << a = gdMapM (thunk observer) fn a
@@ -669,8 +734,8 @@ observe lbl = fst . (gobserve observer lbl)
 observer_ :: (a -> Parent -> a) -> a -> Parent -> a 
 observer_ f a context = sendEnterPacket f a context
 
-gdmobserver_ :: (GObservable f) => f a -> Parent -> f a
-gdmobserver_ a context = gsendEnterPacket a context
+gdmobserver_ :: (GObservable f) => b -> f a -> Parent -> f a
+gdmobserver_ v a context = gsendEnterPacket v a context
 
 \end{code}
 
@@ -694,12 +759,16 @@ generateContext f {- tti -} label orig = unsafeWithUniq $ \node ->
                       })
                , node)
 
-send :: Text -> ObserverM a -> Parent -> a
-send consLabel fn context = unsafeWithUniq $ \ node ->
-     do { let (r,portCount) = runMO fn node 0
-        ; sendEvent node context (Cons portCount consLabel)
-        ; return r
-        }
+send :: b -> Text -> ObserverM a -> Parent -> a
+send v consLabel fn context = unsafeWithUniq $ \ node -> do
+    sv <- mkDynStableName v
+    addAliasNode sv node -- registers a new node for this stablename
+    cid <- getSharing sv
+    let (r,portCount) = runMO fn node 0
+    sendEvent node context (Cons cid portCount consLabel)
+    sr <- mkDynStableName r
+    addAlias sr sv
+    return r
 
 sendEnterPacket :: (a -> Parent -> a) -> a -> Parent -> a
 sendEnterPacket f r context = unsafeWithUniq $ \ node ->
@@ -708,10 +777,10 @@ sendEnterPacket f r context = unsafeWithUniq $ \ node ->
                         (handleExc context)
         }
 
-gsendEnterPacket :: (GObservable f) => f a -> Parent -> f a
-gsendEnterPacket r context = unsafeWithUniq $ \ node ->
+gsendEnterPacket :: (GObservable f) => b -> f a -> Parent -> f a
+gsendEnterPacket v r context = unsafeWithUniq $ \ node ->
      do { sendEvent node context Enter
-        ; ourCatchAllIO (evaluate (gdmobserver r context))
+        ; ourCatchAllIO (evaluate (gdmobserver v r context))
                         (handleExc context)
         }
 
@@ -719,7 +788,7 @@ evaluate :: a -> IO a
 evaluate a = a `seq` return a
 
 sendObserveFnPacket :: ObserverM a -> Parent -> a
-sendObserveFnPacket fn context
+sendObserveFnPacket fn context 
   = unsafeWithUniq $ \ node ->
      do { let (r,_) = runMO fn node 0
         ; sendEvent node context Fun
@@ -766,7 +835,7 @@ ourCatchAllIO = Exception.catch
 
 handleExc :: Parent -> SomeException -> IO a
 -- handleExc context exc = return (send "throw" (return throw << exc) context)
-handleExc context exc = return (send (pack $ show exc) (return (throw exc)) context)
+handleExc context exc = return (send (throw exc) (pack $ show exc) (return (throw exc)) context)
 \end{code}
 
 %************************************************************************

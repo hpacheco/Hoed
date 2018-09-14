@@ -247,16 +247,16 @@ firstRun = unsafePerformIO $ newIORef True
 
 -- | run some code and return the Trace
 debugO :: IO a -> IO Trace
-debugO program =
-     do { runOnce
-        ; initUniq
-        ; let errorMsg e = "[Escaping Exception in Code : " ++ show e ++ "]"
-        ; ourCatchAllIO (do { _ <- program ; return () })
-                        (hPutStrLn stderr . errorMsg)
-        ; res <- endEventStream
-        ; initUniq
-        ; return res
-        }
+debugO program = do
+    runOnce
+    initUniq
+    let errorMsg e = "[Escaping Exception in Code : " ++ show e ++ "]"
+    ourCatchAllIO (do { _ <- program ; return () })
+                  (hPutStrLn stderr . errorMsg)
+    res <- endEventStream
+    initUniq
+    return res
+    
 
 -- | The main entry point; run some IO code, and debug inside it.
 --   After the IO action is completed, an algorithmic debugging session is started at

@@ -203,8 +203,8 @@ eventsToCDS pairs = getChild (-1) 0
         Enter               -> CDSEntered node
         Fun                 -> CDSFun node (normalizeCDS <$> getChild node 0)
                                            (normalizeCDS <$> getChild node 1)
-        ConsChar char       -> CDSChar char
-        Cons portc cons
+        ConsChar cid char       -> CDSChar char
+        Cons cid portc cons
                             -> simplifyCons node cons
                                  [ getChild node (fromIntegral n)
                                  | n <- [0::Int .. fromIntegral portc - 1]]
