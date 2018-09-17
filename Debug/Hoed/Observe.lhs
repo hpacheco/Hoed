@@ -835,7 +835,7 @@ ourCatchAllIO = Exception.catch
 
 handleExc :: Parent -> SomeException -> IO a
 -- handleExc context exc = return (send "throw" (return throw << exc) context)
-handleExc context exc = return (send (throw exc) (pack $ show exc) (return (throw exc)) context)
+handleExc context exc = return (send () (pack $ show exc) (return (throw exc)) context)
 \end{code}
 
 %************************************************************************
