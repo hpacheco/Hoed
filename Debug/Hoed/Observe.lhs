@@ -129,6 +129,7 @@ import Data.IORef
 import System.IO.Unsafe
 import System.Mem.StableName
 import Unsafe.Coerce
+import Safe
 
 \end{code}
 
@@ -151,7 +152,7 @@ import Data.Dynamic ( Dynamic )
 %*                                                                      *
 %************************************************************************
 
-Trival output functions
+Trivial output functions
 
 \begin{code}
 
@@ -163,7 +164,7 @@ data Event = Event { eventParent :: {-# UNPACK #-} !Parent
 
 data EventWithId = EventWithId {eventUID :: !UID, event :: !Event}
 
-type Sharing = (Maybe UID)
+type Sharing = Maybe UID
 
 data Change
         = Observe                 !Text
@@ -175,17 +176,6 @@ data Change
 
 -- | State to keep track of observable sharing
 type Sharings = HashMap DynStableName [UID] -- mapping from sharings to their node occurences
-
---getSharings :: IO Sharings
---getSharings = do
---    as <- readMVar aliases
---    return $ IMap.fromList $ map (\(k,v) -> (getConsId k,getConsId v)) $ HashMap.toList as
---
---logAliases :: IO ()
---logAliases = do
---    as <- readMVar aliases
---    putStrLn "=== Aliases ==="
---    forM_ (HashMap.toList as) $ \(from,to) -> putStrLn $ show (getConsId from) ++ " -> " ++ show (getConsId to)
 
 {-# NOINLINE sharings #-}
 sharings :: MVar Sharings
@@ -215,9 +205,9 @@ getSharing sn = do
     as <- readMVar sharings
     let nodes = concat $ maybeToList $ HMap.lookup sn as
     if length nodes > 1
-        then return $ Just (last nodes)
+        then return $ Just $ last nodes
         else return Nothing
-        
+
 whnf x = x `seq` x
 
 type ParentPosition = Word8
@@ -481,6 +471,7 @@ instance (Observable a,Observable b) => Observable (a -> b) where
 Observing the children of Data types of kind *->*.
 
 \begin{code}
+-- TODO: preserve sharing!
 gdmFunObserver :: (Observable a,Observable b) => Parent -> (a->b) -> (a->b)
 gdmFunObserver cxt fn arg
         = sendObserveFnPacket
