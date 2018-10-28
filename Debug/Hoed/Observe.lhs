@@ -195,6 +195,9 @@ addAliasNode sn node = do
 -- to allow observable sharing
 type DynStableName = StableName ()
 
+instance Show (StableName a) where
+    show = show . hashStableName
+
 mkDynStableName :: a -> IO DynStableName
 mkDynStableName x | x `seq` True = do
     sx <- makeStableName x
@@ -204,6 +207,7 @@ getSharing :: DynStableName -> IO Sharing
 getSharing sn = do
     as <- readMVar sharings
     let nodes = concat $ maybeToList $ HMap.lookup sn as
+    --putStrLn $ "getSharing " ++ show nodes
     if length nodes > 1
         then return $ Just $ last nodes
         else return Nothing
@@ -502,8 +506,9 @@ instance Observable Double  where observer  = observeBase
 instance Observable Char    where
     observer lit cxt = seq lit $ unsafeWithUniq $ \node -> do
         slit <- mkDynStableName lit
-        addAliasNode slit node
+        --let cid = unsafePerformIO $ getSharing slit
         cid <- getSharing slit
+        addAliasNode slit node
         sendEvent node cxt (ConsChar cid lit)
         return lit
     constrain = constrainBase
@@ -516,10 +521,12 @@ instance Observable ()      where observer  = observeOpaque "()"
 -- we evalute to WHNF, and not further.
 
 observeBase :: (Show a) => a -> Parent -> a
-observeBase lit cxt = seq lit $ send lit (pack $ show lit) (return lit) cxt
+observeBase lit cxt = --sendOpaque lit (pack $ show lit) cxt  
+    seq lit $ send lit (pack $ show lit) (return lit) cxt
 
 observeOpaque :: Text -> a -> Parent -> a
-observeOpaque str val cxt = seq val $ send val str (return val) cxt
+observeOpaque str val cxt = --sendOpaque val str cxt
+    seq val $ send val str (return val) cxt
 \end{code}
 
 The Constructors.
@@ -751,15 +758,28 @@ generateContext f {- tti -} label orig = unsafeWithUniq $ \node ->
                , node)
 
 send :: b -> Text -> ObserverM a -> Parent -> a
-send v consLabel fn context = unsafeWithUniq $ \ node -> do
+send !v consLabel fn context = unsafeWithUniq $ \ node -> do
     sv <- mkDynStableName v
+    --putStrLn $ show sv
     addAliasNode sv node -- registers a new node for this stablename
     cid <- getSharing sv
     let (r,portCount) = runMO fn node 0
+    --let cid = unsafePerformIO $ getSharing sv
+    
     sendEvent node context (Cons cid portCount consLabel)
     sr <- mkDynStableName r
     addAlias sr sv
+    --putStrLn $ show sv
+    --addAliasNode sv node
     return r
+
+--sendOpaque :: a -> Text -> Parent -> a
+--sendOpaque !v consLabel context = unsafeWithUniq $ \ node -> do
+--    sv <- mkDynStableName v
+--    let cid = unsafePerformIO $ getSharing sv
+--    sendEvent node context (Cons cid 0 consLabel)
+--    addAliasNode sv node -- registers a new node for this stablename
+--    return v
 
 sendEnterPacket :: (a -> Parent -> a) -> a -> Parent -> a
 sendEnterPacket f r context = unsafeWithUniq $ \ node ->
